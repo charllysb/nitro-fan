@@ -133,7 +133,8 @@ def aplicar_modo(modo):
 
 
 def ler_estado():
-    padrao = {"modo": "auto", "auto_ao_fechar": True, "turbo_auto_critico": False}
+    padrao = {"modo": "auto", "auto_ao_fechar": True, "turbo_auto_critico": False,
+              "turbo_liga": TEMP_CRITICA, "turbo_desliga": 75}
     try:
         with open(ESTADO_ARQ, encoding="utf-8") as f:
             padrao.update(json.load(f))
@@ -292,6 +293,7 @@ class App:
         self.critico = False
         self.ultimo_alerta = 0.0
         self.turbo_foi_automatico = False
+        self.auto_pausado = False   # usuario mexeu na mao: espera esfriar antes de agir de novo
 
         root.title("Nitro Fan")
         root.configure(bg=COR_FUNDO)
@@ -326,12 +328,28 @@ class App:
         opts.pack(pady=(12, 16), padx=18, anchor="w")
         self.var_fechar = tk.BooleanVar(value=self.estado["auto_ao_fechar"])
         self.var_auto_crit = tk.BooleanVar(value=self.estado["turbo_auto_critico"])
-        for texto, var in ((f"Ligar TURBO sozinho se passar de {TEMP_CRITICA}°C", self.var_auto_crit),
-                           ("Voltar ao AUTO ao fechar", self.var_fechar)):
-            tk.Checkbutton(opts, text=texto, variable=var, command=self.persistir,
-                           bg=COR_FUNDO, fg=COR_SUAVE, selectcolor=COR_CARD,
-                           activebackground=COR_FUNDO, activeforeground=COR_TEXTO,
-                           font=("Segoe UI", 9), bd=0, highlightthickness=0).pack(anchor="w")
+        self.var_liga = tk.IntVar(value=self.estado["turbo_liga"])
+        self.var_desliga = tk.IntVar(value=self.estado["turbo_desliga"])
+        estilo = dict(bg=COR_FUNDO, fg=COR_SUAVE, font=("Segoe UI", 9))
+        caixa = dict(bg=COR_FUNDO, fg=COR_SUAVE, selectcolor=COR_CARD, activebackground=COR_FUNDO,
+                     activeforeground=COR_TEXTO, font=("Segoe UI", 9), bd=0, highlightthickness=0)
+
+        tk.Checkbutton(opts, text="Turbo automático por temperatura", variable=self.var_auto_crit,
+                       command=self.persistir, **caixa).pack(anchor="w")
+        faixa = tk.Frame(opts, bg=COR_FUNDO)
+        faixa.pack(anchor="w", padx=(22, 0), pady=(0, 4))
+        for i, (texto, var) in enumerate((("liga acima de", self.var_liga),
+                                          ("volta ao AUTO abaixo de", self.var_desliga))):
+            tk.Label(faixa, text=texto, **estilo).grid(row=i, column=0, sticky="w")
+            tk.Spinbox(faixa, from_=40, to=100, width=4, textvariable=var, command=self.ajustar_faixa,
+                       bg=COR_CARD, fg=COR_TEXTO, buttonbackground=COR_CARD, insertbackground=COR_TEXTO,
+                       relief="flat", font=("Segoe UI", 9), justify="center").grid(row=i, column=1, padx=6, pady=1)
+            tk.Label(faixa, text="°C", **estilo).grid(row=i, column=2, sticky="w")
+        for var in (self.var_liga, self.var_desliga):
+            var.trace_add("write", lambda *_: self.root.after_idle(self.ajustar_faixa))
+
+        tk.Checkbutton(opts, text="Voltar ao AUTO ao fechar", variable=self.var_fechar,
+                       command=self.persistir, **caixa).pack(anchor="w")
 
         root.protocol("WM_DELETE_WINDOW", self.fechar)
         self.atualizar_rotulos("Estado salvo da última vez (pode não refletir o hardware)")
@@ -342,6 +360,8 @@ class App:
     def alternar(self, novo=None, origem="manual"):
         if self.ocupado:
             return
+        if origem == "manual" and self.var_auto_crit.get():
+            self.auto_pausado = True
         novo = novo or ("auto" if self.modo == "turbo" else "turbo")
         self.ocupado = True
         self.lbl_status.config(text="Aplicando...", fg=COR_SUAVE)
@@ -357,10 +377,12 @@ class App:
             self.lbl_status.config(text=msg, fg=COR_WARN)
             return
         self.modo = novo
-        self.turbo_foi_automatico = (origem == "critico" and novo == "turbo")
+        self.turbo_foi_automatico = (origem == "temperatura" and novo == "turbo")
         self.persistir()
-        if origem == "critico":
-            self.atualizar_rotulos("Turbo ligado automaticamente — temperatura crítica")
+        if origem == "temperatura":
+            liga, desliga = self.faixa()
+            self.atualizar_rotulos(f"Turbo automático — passou de {liga}°C" if novo == "turbo"
+                                   else f"De volta ao AUTO — abaixo de {desliga}°C")
         else:
             self.atualizar_rotulos("Turbo ligado — CPU e GPU no máximo" if novo == "turbo"
                                    else "Controle automático do firmware")
@@ -388,6 +410,39 @@ class App:
             self.alertar(maxima, primeira_vez=not estava_critico)
         else:
             self.root.title("Nitro Fan")
+        if temps:
+            self.turbo_por_temperatura(maxima)
+
+    def faixa(self):
+        """(liga, desliga) validos; se o campo estiver no meio da digitacao, usa o ultimo salvo."""
+        try:
+            liga, desliga = self.var_liga.get(), self.var_desliga.get()
+        except tk.TclError:
+            return self.estado["turbo_liga"], self.estado["turbo_desliga"]
+        return liga, min(desliga, liga - 1)
+
+    def ajustar_faixa(self):
+        try:
+            liga, desliga = self.var_liga.get(), self.var_desliga.get()
+        except tk.TclError:
+            return
+        if desliga >= liga:
+            self.var_desliga.set(liga - 1)
+        self.persistir()
+
+    def turbo_por_temperatura(self, maxima):
+        """Liga o turbo acima do limite e devolve ao AUTO abaixo do outro (so o turbo que ele ligou)."""
+        if not self.var_auto_crit.get() or self.ocupado:
+            return
+        liga, desliga = self.faixa()
+        if maxima < desliga:
+            self.auto_pausado = False
+        if self.auto_pausado:
+            return
+        if self.modo != "turbo" and maxima >= liga:
+            self.alternar("turbo", origem="temperatura")
+        elif self.modo == "turbo" and self.turbo_foi_automatico and maxima < desliga:
+            self.alternar("auto", origem="temperatura")
 
     def alertar(self, temp, primeira_vez):
         self.root.title(f"⚠ {temp}°C — CRÍTICO")
@@ -403,13 +458,14 @@ class App:
                 ctypes.windll.user32.FlashWindow(ctypes.windll.user32.GetParent(self.root.winfo_id()), True)
             except Exception:
                 pass
-        if self.var_auto_crit.get() and self.modo != "turbo" and not self.ocupado:
-            self.alternar("turbo", origem="critico")
 
     # ---- persistencia / saida
     def persistir(self):
+        liga, desliga = self.faixa()
+        self.estado.update(turbo_liga=liga, turbo_desliga=desliga)
         salvar_estado({"modo": self.modo, "auto_ao_fechar": self.var_fechar.get(),
-                       "turbo_auto_critico": self.var_auto_crit.get()})
+                       "turbo_auto_critico": self.var_auto_crit.get(),
+                       "turbo_liga": liga, "turbo_desliga": desliga})
 
     def fechar(self):
         self.monitor.parar()

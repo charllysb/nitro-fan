@@ -23,8 +23,12 @@ rodando em segundo plano e sem nada instalado.
   modo turbo, com CPU e GPU no máximo, e o controle automático do firmware.
 - **Temperatura e RPM** de CPU e GPU, atualizados a cada 2 segundos.
 - **Gráfico** dos últimos 5 minutos, com a escala acompanhando os dados.
-- **Alerta acima de 90 °C:** a janela vem para frente e pisca. Opcionalmente,
-  liga o turbo sozinho.
+- **Turbo automático por temperatura (opcional):** você escolhe a faixa. Por
+  exemplo, liga o turbo acima de 85 °C e volta ao Auto abaixo de 70 °C. A
+  diferença entre os dois evita que fique ligando e desligando. O turbo ligado à
+  mão nunca é desligado sozinho, e se você mudar o modo à mão o automático espera
+  a temperatura cair antes de agir de novo.
+- **Alerta acima de 90 °C:** a janela vem para frente e pisca.
 - **Volta ao Auto ao fechar** (opcional), para o notebook não ficar no turbo
   depois de fechado.
 
