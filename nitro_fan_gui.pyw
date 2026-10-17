@@ -26,6 +26,7 @@ ESTADO_ARQ = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "n
 TEMP_ALERTA = 80    # °C - amarelo
 TEMP_CRITICA = 90   # °C - vermelho + alerta
 INTERVALO = 2       # segundos entre leituras
+HIST_MIN = 5        # minutos no grafico
 
 COR_FUNDO = "#0f1012"
 COR_CARD = "#1a1c20"
@@ -35,6 +36,8 @@ COR_TURBO = "#e3242b"   # vermelho Nitro
 COR_AUTO = "#3a3f47"
 COR_OK = "#3ecf6e"
 COR_WARN = "#f0a500"
+COR_CPU = "#4ea8ff"    # linhas do grafico
+COR_GPU = "#c77dff"
 
 NO_WINDOW = 0x08000000
 
@@ -187,12 +190,12 @@ def cor_temp(t):
 
 
 class CardSensor:
-    """Card com temperatura grande, RPM e mini-grafico dos ultimos ~2 min."""
-    W, H = 150, 118
+    """Card com temperatura grande e RPM; a bolinha colorida liga o card a linha do grafico."""
+    W, H = 150, 84
 
-    def __init__(self, pai, titulo):
+    def __init__(self, pai, titulo, cor_linha):
         self.titulo = titulo
-        self.hist = deque(maxlen=60)
+        self.cor_linha = cor_linha
         self.temp = None
         self.rpm = None
         self.c = tk.Canvas(pai, width=self.W, height=self.H, bg=COR_CARD, highlightthickness=0)
@@ -201,15 +204,14 @@ class CardSensor:
     def atualizar(self, temp, rpm):
         self.temp = temp if temp is not None and 0 < temp <= 125 else None
         self.rpm = rpm if rpm is not None and rpm >= 0 else None
-        if self.temp is not None:
-            self.hist.append(self.temp)
         self.desenhar()
 
     def desenhar(self):
-        c, W, H = self.c, self.W, self.H
+        c, W = self.c, self.W
         c.delete("all")
         cor = cor_temp(self.temp)
-        c.create_text(12, 14, text=self.titulo, anchor="w", fill=COR_SUAVE, font=("Segoe UI", 9, "bold"))
+        c.create_oval(12, 10, 20, 18, fill=self.cor_linha, outline="")
+        c.create_text(26, 14, text=self.titulo, anchor="w", fill=COR_SUAVE, font=("Segoe UI", 9, "bold"))
         if self.temp is not None and self.temp >= TEMP_CRITICA:
             c.create_text(W - 10, 14, text="CRÍTICO", anchor="e", fill=COR_TURBO, font=("Segoe UI", 8, "bold"))
         txt = f"{self.temp}°" if self.temp is not None else "--"
@@ -217,18 +219,64 @@ class CardSensor:
         rpm = f"{self.rpm} RPM" if self.rpm is not None else "RPM --"
         c.create_text(12, 72, text=rpm, anchor="w", fill=COR_SUAVE, font=("Segoe UI", 9))
 
-        # mini grafico 40..100 °C
-        x0, y0, x1, y1 = 10, 84, W - 10, H - 8
-        y_crit = y1 - (TEMP_CRITICA - 40) / 60 * (y1 - y0)
-        c.create_line(x0, y_crit, x1, y_crit, fill="#3d1012", dash=(2, 3))
-        if len(self.hist) >= 2:
-            n = self.hist.maxlen - 1
+
+class Grafico:
+    """Temperatura de CPU e GPU nos ultimos HIST_MIN minutos; a escala acompanha os dados."""
+    W, H = 308, 150
+    ESQ, DIR, TOPO, BASE = 34, 10, 26, 22   # margens
+
+    def __init__(self, pai):
+        self.hist = deque(maxlen=HIST_MIN * 60 // INTERVALO)
+        self.c = tk.Canvas(pai, width=self.W, height=self.H, bg=COR_CARD, highlightthickness=0)
+        self.desenhar()
+
+    def adicionar(self, cpu, gpu):
+        self.hist.append((cpu, gpu))
+        self.desenhar()
+
+    def desenhar(self):
+        c, W, H = self.c, self.W, self.H
+        c.delete("all")
+        c.create_text(12, 14, text="TEMPERATURA", anchor="w", fill=COR_SUAVE, font=("Segoe UI", 9, "bold"))
+        x0, x1, y0, y1 = self.ESQ, W - self.DIR, self.TOPO, H - self.BASE
+
+        vals = [t for par in self.hist for t in par if t is not None]
+        if not vals:
+            c.create_text(W / 2, (y0 + y1) / 2, text="Lendo sensores...", fill=COR_SUAVE, font=("Segoe UI", 9))
+            return
+
+        # escala: margem de 3 °C, multiplos de 5, pelo menos 15 °C de altura
+        lo = (min(vals) - 3) // 5 * 5
+        hi = -((-(max(vals) + 3)) // 5) * 5
+        if hi - lo < 15:
+            hi = lo + 15
+        passo = 5 if hi - lo <= 30 else 10
+
+        def y_de(t):
+            return y1 - (t - lo) / (hi - lo) * (y1 - y0)
+
+        for t in range(int(lo), int(hi) + 1, passo):
+            y = y_de(t)
+            c.create_line(x0, y, x1, y, fill="#24272c")
+            c.create_text(x0 - 6, y, text=f"{t}°", anchor="e", fill=COR_SUAVE, font=("Segoe UI", 7))
+        if lo < TEMP_CRITICA <= hi:
+            y = y_de(TEMP_CRITICA)
+            c.create_line(x0, y, x1, y, fill=COR_TURBO, dash=(3, 3))
+        c.create_text(x0, y1 + 12, text=f"-{HIST_MIN} min", anchor="w", fill=COR_SUAVE, font=("Segoe UI", 7))
+        c.create_text(x1, y1 + 12, text="agora", anchor="e", fill=COR_SUAVE, font=("Segoe UI", 7))
+
+        n = self.hist.maxlen - 1
+        desloc = n + 1 - len(self.hist)   # dados novos entram pela direita
+        for i, cor in ((0, COR_CPU), (1, COR_GPU)):
             pts = []
-            for k, t in enumerate(self.hist):
-                x = x0 + (x1 - x0) * (k + n + 1 - len(self.hist)) / n
-                y = y1 - (min(max(t, 40), 100) - 40) / 60 * (y1 - y0)
-                pts += [x, y]
-            c.create_line(*pts, fill=cor, width=2, smooth=True)
+            for k, par in enumerate(self.hist):
+                if par[i] is not None:
+                    pts.append((x0 + (x1 - x0) * (k + desloc) / n, y_de(par[i])))
+            if len(pts) >= 2:
+                c.create_line(*[v for p in pts for v in p], fill=cor, width=2)
+            if pts:
+                x, y = pts[-1]
+                c.create_oval(x - 3, y - 3, x + 3, y + 3, fill=cor, outline="")
 
 
 class App:
@@ -267,10 +315,12 @@ class App:
 
         cards = tk.Frame(root, bg=COR_FUNDO)
         cards.pack(padx=18)
-        self.card_cpu = CardSensor(cards, "CPU")
-        self.card_gpu = CardSensor(cards, "GPU")
+        self.card_cpu = CardSensor(cards, "CPU", COR_CPU)
+        self.card_gpu = CardSensor(cards, "GPU", COR_GPU)
         self.card_cpu.c.pack(side="left", padx=(0, 8))
         self.card_gpu.c.pack(side="left")
+        self.grafico = Grafico(root)
+        self.grafico.c.pack(padx=18, pady=(8, 0))
 
         opts = tk.Frame(root, bg=COR_FUNDO)
         opts.pack(pady=(12, 16), padx=18, anchor="w")
@@ -327,6 +377,7 @@ class App:
             return
         self.card_cpu.atualizar(d.get("cpu"), d.get("fcpu"))
         self.card_gpu.atualizar(d.get("gpu"), d.get("fgpu"))
+        self.grafico.adicionar(self.card_cpu.temp, self.card_gpu.temp)
 
         temps = [t for t in (self.card_cpu.temp, self.card_gpu.temp) if t is not None]
         maxima = max(temps) if temps else 0
