@@ -19,6 +19,12 @@ import time
 import tkinter as tk
 from collections import deque
 
+try:  # opcional: sem pystray/Pillow o app funciona, so nao vai para a bandeja
+    import pystray
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    pystray = None
+
 # ---------------------------------------------------------------- config
 VALORES = {"turbo": 0x820009, "auto": 0x410009}  # CPU+GPU: 10=turbo, 01=auto
 ESTADO_ARQ = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "nitro_fan_estado.json")
@@ -284,8 +290,46 @@ class Grafico:
                 c.create_oval(x - 3, y - 3, x + 3, y + 3, fill=cor, outline="")
 
 
+class Bandeja:
+    """Icone na bandeja do sistema com a temperatura mais alta escrita nele."""
+
+    def __init__(self, app):
+        self.app = app
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir", lambda: self._na_tela(app.mostrar), default=True),
+            pystray.MenuItem(lambda item: "Voltar ao AUTO" if app.modo == "turbo" else "Ligar TURBO",
+                             lambda: self._na_tela(app.alternar)),
+            pystray.MenuItem("Sair", lambda: self._na_tela(app.fechar)))
+        self.icon = pystray.Icon("nitro_fan", self.desenhar(None), "Nitro Fan", menu)
+        self.icon.run_detached()
+
+    def _na_tela(self, func):
+        self.app.root.after(0, func)  # callbacks do pystray chegam em outra thread
+
+    @staticmethod
+    def desenhar(temp):
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((0, 0, 63, 63), radius=12, fill=COR_CARD)
+        txt = str(temp) if temp is not None else "--"
+        try:
+            fonte = ImageFont.truetype("segoeuib.ttf", 44 if len(txt) <= 2 else 32)
+        except OSError:
+            fonte = ImageFont.load_default()
+        d.text((32, 33), txt, font=fonte, fill=cor_temp(temp), anchor="mm")
+        return img
+
+    def atualizar(self, temp, dica):
+        self.icon.icon = self.desenhar(temp)
+        self.icon.title = dica[:127]  # limite do Windows para a dica
+        self.icon.update_menu()
+
+    def parar(self):
+        self.icon.stop()
+
+
 class App:
-    TAM = 190
+    TAM = 150
 
     def __init__(self, root):
         self.root = root
@@ -304,20 +348,20 @@ class App:
         root.resizable(False, False)
 
         tk.Label(root, text="NITRO FAN", bg=COR_FUNDO, fg=COR_TEXTO,
-                 font=("Segoe UI", 16, "bold")).pack(pady=(16, 0))
+                 font=("Segoe UI", 16, "bold")).pack(pady=(12, 0))
         tk.Label(root, text="clique na ventoinha ou aperte espaço", bg=COR_FUNDO,
                  fg=COR_SUAVE, font=("Segoe UI", 9)).pack()
 
         self.canvas = tk.Canvas(root, width=self.TAM, height=self.TAM, bg=COR_FUNDO,
                                 highlightthickness=0, cursor="hand2")
-        self.canvas.pack(pady=10)
+        self.canvas.pack(pady=6)
         self.canvas.bind("<Button-1>", lambda e: self.alternar())
         root.bind("<space>", lambda e: self.alternar())
 
         self.lbl_modo = tk.Label(root, text="", bg=COR_FUNDO, font=("Segoe UI", 20, "bold"))
         self.lbl_modo.pack()
         self.lbl_status = tk.Label(root, text="", bg=COR_FUNDO, fg=COR_SUAVE, font=("Segoe UI", 9))
-        self.lbl_status.pack(pady=(2, 12))
+        self.lbl_status.pack(pady=(2, 8))
 
         cards = tk.Frame(root, bg=COR_FUNDO)
         cards.pack(padx=18)
@@ -329,7 +373,7 @@ class App:
         self.grafico.c.pack(padx=18, pady=(8, 0))
 
         opts = tk.Frame(root, bg=COR_FUNDO)
-        opts.pack(pady=(12, 16), padx=18, anchor="w")
+        opts.pack(pady=(10, 12), padx=18, anchor="w")
         self.var_fechar = tk.BooleanVar(value=self.estado["auto_ao_fechar"])
         self.var_auto_crit = tk.BooleanVar(value=self.estado["turbo_auto_critico"])
         self.var_liga = tk.IntVar(value=self.estado["turbo_liga"])
@@ -356,6 +400,9 @@ class App:
                        command=self.persistir, **caixa).pack(anchor="w")
 
         root.protocol("WM_DELETE_WINDOW", self.fechar)
+        self.bandeja = Bandeja(self) if pystray else None
+        if self.bandeja:  # minimizar esconde na bandeja
+            root.bind("<Unmap>", lambda e: e.widget is root and root.state() == "iconic" and root.withdraw())
         self.atualizar_rotulos("Estado salvo da última vez (pode não refletir o hardware)")
         self.monitor = Monitor(lambda d: root.after(0, self.on_sensores, d))
         self.animar()
@@ -395,6 +442,23 @@ class App:
         turbo = self.modo == "turbo"
         self.lbl_modo.config(text="TURBO" if turbo else "AUTO", fg=COR_TURBO if turbo else COR_TEXTO)
         self.lbl_status.config(text=status, fg=COR_SUAVE)
+        self.atualizar_bandeja()
+
+    def atualizar_bandeja(self):
+        if not self.bandeja:
+            return
+        cpu, gpu = self.card_cpu, self.card_gpu
+        temps = [t for t in (cpu.temp, gpu.temp) if t is not None]
+        fmt = lambda v, u: f"{v}{u}" if v is not None else "--"
+        dica = (f"Nitro Fan — {self.modo.upper()}\n"
+                f"CPU {fmt(cpu.temp, '°C')} · {fmt(cpu.rpm, ' RPM')}\n"
+                f"GPU {fmt(gpu.temp, '°C')} · {fmt(gpu.rpm, ' RPM')}")
+        self.bandeja.atualizar(max(temps) if temps else None, dica)
+
+    def mostrar(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     # ---- sensores
     def on_sensores(self, d):
@@ -404,6 +468,7 @@ class App:
         self.card_cpu.atualizar(d.get("cpu"), d.get("fcpu"))
         self.card_gpu.atualizar(d.get("gpu"), d.get("fgpu"))
         self.grafico.adicionar(self.card_cpu.temp, self.card_gpu.temp)
+        self.atualizar_bandeja()
 
         temps = [t for t in (self.card_cpu.temp, self.card_gpu.temp) if t is not None]
         maxima = max(temps) if temps else 0
@@ -475,6 +540,8 @@ class App:
 
     def fechar(self):
         self.monitor.parar()
+        if self.bandeja:
+            self.bandeja.parar()
         if self.var_fechar.get() and self.modo == "turbo":
             self.lbl_status.config(text="Voltando ao AUTO...")
             self.root.update()
@@ -489,6 +556,9 @@ class App:
         alvo = 18.0 if self.modo == "turbo" else 2.5
         self.velocidade += (alvo - self.velocidade) * 0.06
         self.angulo = (self.angulo + self.velocidade) % 360
+        if self.root.state() == "withdrawn":  # escondido na bandeja: nao gasta CPU desenhando
+            self.root.after(250, self.animar)
+            return
         self.desenhar_fan()
         self.root.after(16, self.animar)
 

@@ -28,7 +28,12 @@ rodando em segundo plano e sem nada instalado.
   diferença entre os dois evita que fique ligando e desligando. O turbo ligado à
   mão nunca é desligado sozinho, e se você mudar o modo à mão o automático espera
   a temperatura cair antes de agir de novo.
-- **Alerta acima de 90 °C:** a janela vem para frente e pisca.
+- **Alerta acima de 90 °C:** a janela vem para frente e pisca. Com o turbo
+  automático ligado, só pisca na barra de tarefas, sem cobrir o que você está fazendo.
+- **Fica na bandeja:** ao minimizar, o app vai para perto do relógio. O ícone
+  mostra a temperatura mais alta, com a cor mudando conforme o calor. Passando o
+  mouse aparecem CPU, GPU, RPM e o modo. O clique direito abre o menu (Abrir,
+  Turbo/Auto, Sair).
 - **Volta ao Auto ao fechar** (opcional), para o notebook não ficar no turbo
   depois de fechado.
 
@@ -48,8 +53,9 @@ Não precisa instalar nada. As opções ficam salvas em `%APPDATA%\nitro_fan_est
 
 ### Sem o executável
 
-Com o Python 3 instalado, dê dois cliques em `nitro_fan_gui.pyw`. Não há
-dependências. Para usar só pela linha de comando, existem os atalhos `TURBO.bat` e
+Com o Python 3 instalado, dê dois cliques em `nitro_fan_gui.pyw`. O ícone na
+bandeja precisa de `python -m pip install pystray pillow`; sem eles, o resto
+funciona normalmente. Para usar só pela linha de comando, existem os atalhos `TURBO.bat` e
 `AUTO.bat` (que chamam o `nitro-fan.ps1`).
 
 ## Compatibilidade
@@ -110,6 +116,6 @@ ou `$r.OutParameters` dá `$null`, que vira 0. A saída se lê por
 Para gerar o executável:
 
 ```bat
-python -m pip install pyinstaller
+python -m pip install pyinstaller pystray pillow
 build.bat
 ```
