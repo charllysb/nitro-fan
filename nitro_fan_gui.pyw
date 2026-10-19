@@ -7,8 +7,8 @@ Fala direto com o firmware via WMI (classe AcerGamingFunction):
   - GetGamingSysInfo      -> sensores (comando 0x0001 | id_sensor << 8)
 Sem dependencias: so Python 3 (tkinter vem junto). Extensao .pyw = abre sem console.
 """
-import base64
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -111,9 +111,13 @@ def elevar():
 
 
 def ps_args(script):
-    """-EncodedCommand evita qualquer problema de aspas/quebras de linha."""
-    enc = base64.b64encode(script.encode("utf-16-le")).decode()
-    return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc]
+    """Grava o script num .ps1 e roda com -File. (-EncodedCommand faz antivirus apagar o .exe.)"""
+    pasta = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "NitroFan")
+    os.makedirs(pasta, exist_ok=True)
+    arq = os.path.join(pasta, hashlib.sha1(script.encode()).hexdigest()[:12] + ".ps1")
+    with open(arq, "w", encoding="utf-8-sig") as f:
+        f.write(script)
+    return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", arq]
 
 
 def aplicar_modo(modo):
