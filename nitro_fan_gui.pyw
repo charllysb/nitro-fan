@@ -454,11 +454,13 @@ class App:
         if primeira_vez or agora - self.ultimo_alerta > 60:  # no maximo 1 aviso/min
             self.ultimo_alerta = agora
             try:
-                self.root.deiconify()
-                self.root.lift()
-                self.root.attributes("-topmost", True)
-                self.root.after(1500, lambda: self.root.attributes("-topmost", False))
-                self.root.bell()
+                # com o turbo automatico ligado o app ja esta agindo: so pisca na barra de tarefas
+                if not self.var_auto_crit.get():
+                    self.root.deiconify()
+                    self.root.lift()
+                    self.root.attributes("-topmost", True)
+                    self.root.after(1500, lambda: self.root.attributes("-topmost", False))
+                    self.root.bell()
                 ctypes.windll.user32.FlashWindow(ctypes.windll.user32.GetParent(self.root.winfo_id()), True)
             except Exception:
                 pass
