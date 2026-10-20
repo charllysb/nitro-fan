@@ -26,13 +26,17 @@ except ImportError:
     pystray = None
 
 # ---------------------------------------------------------------- config
-VALORES = {"turbo": 0x820009, "auto": 0x410009}  # CPU+GPU: 10=turbo, 01=auto
+VALORES = {"turbo": 0x820009, "auto": 0x410009, "curva": 0xC30009}  # CPU+GPU: 10=turbo, 01=auto, 11=manual
+FAN_IDS = (1, 4)    # SetGamingFanSpeed: 1 = CPU, 4 = GPU
 ESTADO_ARQ = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "nitro_fan_estado.json")
 
 TEMP_ALERTA = 80    # °C - amarelo
 TEMP_CRITICA = 90   # °C - vermelho + alerta
 INTERVALO = 2       # segundos entre leituras
 HIST_MIN = 5        # minutos no grafico
+CURVA_MIN, CURVA_MAX = 40, 100   # % - abaixo de 40% o firmware nao desce do piso (~3900 RPM)
+CURVA_PASSO = 5     # % - arredondamento e descida maxima por leitura
+SEM_LEITURA_MAX = 10  # s sem leitura no modo curva -> volta ao AUTO
 
 COR_FUNDO = "#0f1012"
 COR_CARD = "#1a1c20"
@@ -44,6 +48,7 @@ COR_OK = "#3ecf6e"
 COR_WARN = "#f0a500"
 COR_CPU = "#4ea8ff"    # linhas do grafico
 COR_GPU = "#c77dff"
+COR_CURVA = "#4ea8ff"
 
 NO_WINDOW = 0x08000000
 
@@ -51,12 +56,15 @@ PS_SET = r"""
 $ErrorActionPreference='Stop'
 $c=Get-CimClass -Namespace root/WMI -ClassName AcerGamingFunction
 $i=Get-CimInstance -Namespace root/WMI -ClassName AcerGamingFunction | Select-Object -First 1
-$m=$c.CimClassMethods['SetGamingFanBehavior']
+$m=$c.CimClassMethods['__METODO__']
 $p=($m.Parameters | Where-Object { $_.Qualifiers.Name -contains 'In' } | Select-Object -First 1).Name
 if(-not $p){ $p=($m.Parameters | Select-Object -First 1).Name }
-$r=Invoke-CimMethod -InputObject $i -MethodName SetGamingFanBehavior -Arguments @{ $p=[uint64]__VALOR__ }
-$o=($r.PSObject.Properties | Where-Object { $_.Name -notin 'ReturnValue','PSComputerName' -and $_.Value -ne $null } | Select-Object -First 1).Value
-if($o -ne $null){ Write-Output $o } else { Write-Output 'OK' }
+foreach($v in @(__VALORES__)){
+  $r=Invoke-CimMethod -InputObject $i -MethodName __METODO__ -Arguments @{ $p=[uint64]$v }
+  $o=($r.PSObject.Properties | Where-Object { $_.Name -notin 'ReturnValue','PSComputerName' -and $_.Value -ne $null } | Select-Object -First 1).Value
+  if($o -ne $null -and ([uint64]$o -band 0xFF) -ne 0){ Write-Output $o; exit }
+}
+Write-Output 'OK'
 """
 
 # Processo PowerShell persistente: le sensores e imprime 1 linha JSON a cada INTERVALO.
@@ -126,10 +134,11 @@ def ps_args(script):
     return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", arq]
 
 
-def aplicar_modo(modo):
-    """Retorna (ok, mensagem)."""
+def chamar_firmware(metodo, valores):
+    """Chama um metodo Set* com cada valor, em ordem. Retorna (ok, mensagem)."""
+    script = PS_SET.replace("__METODO__", metodo).replace("__VALORES__", ",".join(hex(v) for v in valores))
     try:
-        r = subprocess.run(ps_args(PS_SET.replace("__VALOR__", hex(VALORES[modo]))),
+        r = subprocess.run(ps_args(script),
                            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW)
     except Exception as e:
         return False, f"Falha ao chamar PowerShell: {e}"
@@ -142,9 +151,28 @@ def aplicar_modo(modo):
     return True, "OK"
 
 
+def aplicar_modo(modo):
+    return chamar_firmware("SetGamingFanBehavior", [VALORES[modo]])
+
+
+def aplicar_rotacao(pct):
+    """Rotacao das duas ventoinhas em % (so vale no modo curva)."""
+    return chamar_firmware("SetGamingFanSpeed", [fan | (pct << 8) for fan in FAN_IDS])
+
+
+def pct_da_curva(temp, t_min, t_max):
+    """CURVA_MIN% ate t_min, sobe em linha reta ate CURVA_MAX% em t_max (arredonda para cima)."""
+    if temp <= t_min:
+        return CURVA_MIN
+    if temp >= t_max:
+        return CURVA_MAX
+    pct = CURVA_MIN + (CURVA_MAX - CURVA_MIN) * (temp - t_min) / (t_max - t_min)
+    return min(CURVA_MAX, math.ceil(pct / CURVA_PASSO) * CURVA_PASSO)
+
+
 def ler_estado():
     padrao = {"modo": "auto", "auto_ao_fechar": True, "turbo_auto_critico": False,
-              "turbo_liga": TEMP_CRITICA, "turbo_desliga": 75}
+              "turbo_liga": TEMP_CRITICA, "turbo_desliga": 75, "curva_min": 60, "curva_max": 85}
     try:
         with open(ESTADO_ARQ, encoding="utf-8") as f:
             padrao.update(json.load(f))
@@ -290,6 +318,9 @@ class Grafico:
                 c.create_oval(x - 3, y - 3, x + 3, y + 3, fill=cor, outline="")
 
 
+MODOS = ("auto", "curva", "turbo")
+
+
 class Bandeja:
     """Icone na bandeja do sistema com a temperatura mais alta escrita nele."""
 
@@ -297,11 +328,16 @@ class Bandeja:
         self.app = app
         menu = pystray.Menu(
             pystray.MenuItem("Abrir", lambda: self._na_tela(app.mostrar), default=True),
-            pystray.MenuItem(lambda item: "Voltar ao AUTO" if app.modo == "turbo" else "Ligar TURBO",
-                             lambda: self._na_tela(app.alternar)),
+            pystray.Menu.SEPARATOR,
+            *[pystray.MenuItem(m.upper(), self._escolher(m), radio=True,
+                               checked=lambda item, m=m: app.modo == m) for m in MODOS],
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", lambda: self._na_tela(app.fechar)))
         self.icon = pystray.Icon("nitro_fan", self.desenhar(None), "Nitro Fan", menu)
         self.icon.run_detached()
+
+    def _escolher(self, modo):
+        return lambda: self._na_tela(lambda: self.app.alternar(modo))
 
     def _na_tela(self, func):
         self.app.root.after(0, func)  # callbacks do pystray chegam em outra thread
@@ -335,6 +371,14 @@ class App:
         self.root = root
         self.estado = ler_estado()
         self.modo = self.estado["modo"]
+        # curva so e retomada depois da primeira leitura (precisa da temperatura)
+        self.retomar_curva = self.modo == "curva"
+        if self.retomar_curva:
+            self.modo = "auto"
+        self.pct = None             # ultima rotacao gravada no modo curva
+        self.enviando_pct = False
+        self.ultima_leitura = time.time()
+        self.motivo_falha = ""
         self.ocupado = False
         self.angulo = 0.0
         self.velocidade = 0.0
@@ -349,8 +393,6 @@ class App:
 
         tk.Label(root, text="NITRO FAN", bg=COR_FUNDO, fg=COR_TEXTO,
                  font=("Segoe UI", 16, "bold")).pack(pady=(12, 0))
-        tk.Label(root, text="clique na ventoinha ou aperte espaço", bg=COR_FUNDO,
-                 fg=COR_SUAVE, font=("Segoe UI", 9)).pack()
 
         self.canvas = tk.Canvas(root, width=self.TAM, height=self.TAM, bg=COR_FUNDO,
                                 highlightthickness=0, cursor="hand2")
@@ -360,6 +402,15 @@ class App:
 
         self.lbl_modo = tk.Label(root, text="", bg=COR_FUNDO, font=("Segoe UI", 20, "bold"))
         self.lbl_modo.pack()
+        seletor = tk.Frame(root, bg=COR_CARD)
+        seletor.pack(pady=(4, 0))
+        self.botoes = {}
+        for m in MODOS:
+            b = tk.Label(seletor, text=m.upper(), bg=COR_CARD, fg=COR_SUAVE, cursor="hand2",
+                         font=("Segoe UI", 9, "bold"), padx=14, pady=3)
+            b.pack(side="left")
+            b.bind("<Button-1>", lambda e, m=m: self.alternar(m))
+            self.botoes[m] = b
         self.lbl_status = tk.Label(root, text="", bg=COR_FUNDO, fg=COR_SUAVE, font=("Segoe UI", 9))
         self.lbl_status.pack(pady=(2, 8))
 
@@ -382,16 +433,33 @@ class App:
         caixa = dict(bg=COR_FUNDO, fg=COR_SUAVE, selectcolor=COR_CARD, activebackground=COR_FUNDO,
                      activeforeground=COR_TEXTO, font=("Segoe UI", 9), bd=0, highlightthickness=0)
 
-        tk.Checkbutton(opts, text="Turbo automático por temperatura", variable=self.var_auto_crit,
+        self.var_curva_min = tk.IntVar(value=self.estado["curva_min"])
+        self.var_curva_max = tk.IntVar(value=self.estado["curva_max"])
+        spin = dict(from_=40, to=100, width=4, bg=COR_CARD, fg=COR_TEXTO, buttonbackground=COR_CARD,
+                    insertbackground=COR_TEXTO, relief="flat", font=("Segoe UI", 9), justify="center")
+
+        # ajustes do modo atual: curva no modo CURVA, turbo automatico nos outros
+        self.ajustes = tk.Frame(opts, bg=COR_FUNDO)
+        self.ajustes.pack(anchor="w", fill="x")
+        self.frm_curva = tk.Frame(self.ajustes, bg=COR_FUNDO)
+        for i, (texto, var) in enumerate(((f"Curva: {CURVA_MIN}% até", self.var_curva_min),
+                                          (f"sobe até {CURVA_MAX}% em", self.var_curva_max))):
+            tk.Label(self.frm_curva, text=texto, **estilo).grid(row=i, column=0, sticky="w")
+            tk.Spinbox(self.frm_curva, textvariable=var, command=self.ajustar_curva,
+                       **spin).grid(row=i, column=1, padx=6, pady=1)
+            tk.Label(self.frm_curva, text="°C", **estilo).grid(row=i, column=2, sticky="w")
+            var.trace_add("write", lambda *_: self.root.after_idle(self.ajustar_curva))
+
+        self.frm_turbo = tk.Frame(self.ajustes, bg=COR_FUNDO)
+        tk.Checkbutton(self.frm_turbo, text="Turbo automático por temperatura", variable=self.var_auto_crit,
                        command=self.persistir, **caixa).pack(anchor="w")
-        faixa = tk.Frame(opts, bg=COR_FUNDO)
+        faixa = tk.Frame(self.frm_turbo, bg=COR_FUNDO)
         faixa.pack(anchor="w", padx=(22, 0), pady=(0, 4))
         for i, (texto, var) in enumerate((("liga acima de", self.var_liga),
                                           ("volta ao AUTO abaixo de", self.var_desliga))):
             tk.Label(faixa, text=texto, **estilo).grid(row=i, column=0, sticky="w")
-            tk.Spinbox(faixa, from_=40, to=100, width=4, textvariable=var, command=self.ajustar_faixa,
-                       bg=COR_CARD, fg=COR_TEXTO, buttonbackground=COR_CARD, insertbackground=COR_TEXTO,
-                       relief="flat", font=("Segoe UI", 9), justify="center").grid(row=i, column=1, padx=6, pady=1)
+            tk.Spinbox(faixa, textvariable=var, command=self.ajustar_faixa,
+                       **spin).grid(row=i, column=1, padx=6, pady=1)
             tk.Label(faixa, text="°C", **estilo).grid(row=i, column=2, sticky="w")
         for var in (self.var_liga, self.var_desliga):
             var.trace_add("write", lambda *_: self.root.after_idle(self.ajustar_faixa))
@@ -406,6 +474,7 @@ class App:
         self.atualizar_rotulos("Estado salvo da última vez (pode não refletir o hardware)")
         self.monitor = Monitor(lambda d: root.after(0, self.on_sensores, d))
         self.animar()
+        self.vigiar()
 
     # ---- modo dos fans
     def alternar(self, novo=None, origem="manual"):
@@ -413,6 +482,8 @@ class App:
             return
         if origem == "manual" and self.var_auto_crit.get():
             self.auto_pausado = True
+        if origem == "manual":
+            self.retomar_curva = False
         novo = novo or ("auto" if self.modo == "turbo" else "turbo")
         self.ocupado = True
         self.lbl_status.config(text="Aplicando...", fg=COR_SUAVE)
@@ -426,11 +497,21 @@ class App:
         self.ocupado = False
         if not ok:
             self.lbl_status.config(text=msg, fg=COR_WARN)
+            if novo == "curva":  # nao conseguiu entrar na curva: garante o AUTO
+                self.falha_curva(f"Não entrou no modo curva ({msg})")
             return
         self.modo = novo
+        self.pct = None
         self.turbo_foi_automatico = (origem == "temperatura" and novo == "turbo")
         self.persistir()
-        if origem == "temperatura":
+        if origem == "falha":
+            self.atualizar_rotulos(self.motivo_falha)
+            self.lbl_status.config(fg=COR_WARN)
+        elif novo == "curva":
+            t_min, t_max = self.curva()
+            self.atualizar_rotulos(f"Curva: {CURVA_MIN}% até {t_min}°C, {CURVA_MAX}% em {t_max}°C")
+            self.ajustar_rotacao()
+        elif origem == "temperatura":
             liga, desliga = self.faixa()
             self.atualizar_rotulos(f"Turbo automático — passou de {liga}°C" if novo == "turbo"
                                    else f"De volta ao AUTO — abaixo de {desliga}°C")
@@ -438,11 +519,26 @@ class App:
             self.atualizar_rotulos("Turbo ligado — CPU e GPU no máximo" if novo == "turbo"
                                    else "Controle automático do firmware")
 
-    def atualizar_rotulos(self, status):
-        turbo = self.modo == "turbo"
-        self.lbl_modo.config(text="TURBO" if turbo else "AUTO", fg=COR_TURBO if turbo else COR_TEXTO)
-        self.lbl_status.config(text=status, fg=COR_SUAVE)
+    def atualizar_rotulos(self, status=None):
+        cor = {"turbo": COR_TURBO, "curva": COR_CURVA}.get(self.modo, COR_TEXTO)
+        self.lbl_modo.config(text=self.nome_modo(), fg=cor)
+        for m, b in self.botoes.items():
+            b.config(bg=cor if m == self.modo else COR_CARD,
+                     fg=COR_FUNDO if m == self.modo else COR_SUAVE)
+        if self.modo == "curva":
+            self.frm_turbo.pack_forget()
+            self.frm_curva.pack(anchor="w", pady=(0, 4))
+        else:
+            self.frm_curva.pack_forget()
+            self.frm_turbo.pack(anchor="w")
+        if status is not None:
+            self.lbl_status.config(text=status, fg=COR_SUAVE)
         self.atualizar_bandeja()
+
+    def nome_modo(self):
+        if self.modo == "curva" and self.pct is not None:
+            return f"CURVA · {self.pct}%"
+        return self.modo.upper()
 
     def atualizar_bandeja(self):
         if not self.bandeja:
@@ -450,7 +546,7 @@ class App:
         cpu, gpu = self.card_cpu, self.card_gpu
         temps = [t for t in (cpu.temp, gpu.temp) if t is not None]
         fmt = lambda v, u: f"{v}{u}" if v is not None else "--"
-        dica = (f"Nitro Fan — {self.modo.upper()}\n"
+        dica = (f"Nitro Fan — {self.nome_modo()}\n"
                 f"CPU {fmt(cpu.temp, '°C')} · {fmt(cpu.rpm, ' RPM')}\n"
                 f"GPU {fmt(gpu.temp, '°C')} · {fmt(gpu.rpm, ' RPM')}")
         self.bandeja.atualizar(max(temps) if temps else None, dica)
@@ -464,6 +560,7 @@ class App:
     def on_sensores(self, d):
         if d is None:
             self.lbl_status.config(text="Sensores indisponíveis neste modelo", fg=COR_WARN)
+            self.falha_curva("Sensores indisponíveis — voltei ao AUTO")
             return
         self.card_cpu.atualizar(d.get("cpu"), d.get("fcpu"))
         self.card_gpu.atualizar(d.get("gpu"), d.get("fgpu"))
@@ -479,8 +576,76 @@ class App:
             self.alertar(maxima, primeira_vez=not estava_critico)
         else:
             self.root.title("Nitro Fan")
-        if temps:
+        if not temps:
+            self.falha_curva("Sem leitura de temperatura — voltei ao AUTO")
+            return
+        self.ultima_leitura = time.time()
+        if self.retomar_curva and not self.ocupado:
+            self.retomar_curva = False
+            self.alternar("curva", origem="retomar")
+        elif self.modo == "curva":
+            self.ajustar_rotacao(maxima)
+        else:
             self.turbo_por_temperatura(maxima)
+
+    # ---- modo curva
+    def curva(self):
+        """(t_min, t_max) validos; no meio da digitacao usa o ultimo salvo."""
+        try:
+            t_min, t_max = self.var_curva_min.get(), self.var_curva_max.get()
+        except tk.TclError:
+            return self.estado["curva_min"], self.estado["curva_max"]
+        return t_min, max(t_max, t_min + 5)
+
+    def ajustar_curva(self):
+        try:
+            t_min, t_max = self.var_curva_min.get(), self.var_curva_max.get()
+        except tk.TclError:
+            return
+        if t_max < t_min + 5:
+            self.var_curva_max.set(t_min + 5)
+        self.persistir()
+        if self.modo == "curva":
+            self.atualizar_rotulos(f"Curva: {CURVA_MIN}% até {t_min}°C, {CURVA_MAX}% em {max(t_max, t_min + 5)}°C")
+
+    def ajustar_rotacao(self, maxima=None):
+        """Grava a % da curva. Sobe na hora; desce no maximo CURVA_PASSO por leitura."""
+        if self.modo != "curva" or self.enviando_pct or self.ocupado:
+            return
+        if maxima is None:
+            temps = [t for t in (self.card_cpu.temp, self.card_gpu.temp) if t is not None]
+            maxima = max(temps) if temps else None
+        alvo = CURVA_MAX if maxima is None else pct_da_curva(maxima, *self.curva())
+        if self.pct is not None and alvo < self.pct:
+            alvo = max(alvo, self.pct - CURVA_PASSO)
+        if alvo == self.pct:
+            return
+        self.enviando_pct = True
+        threading.Thread(target=lambda: self.root.after(0, self._rotacao_gravada, alvo, *aplicar_rotacao(alvo)),
+                         daemon=True).start()
+
+    def _rotacao_gravada(self, pct, ok, msg):
+        self.enviando_pct = False
+        if self.modo != "curva":
+            return
+        if not ok:
+            self.falha_curva(f"Falha ao gravar a rotação ({msg}) — voltei ao AUTO")
+            return
+        self.pct = pct
+        self.atualizar_rotulos()
+
+    def falha_curva(self, motivo):
+        """Qualquer problema no modo curva devolve o controle ao firmware."""
+        self.retomar_curva = False
+        if self.modo != "curva" or self.ocupado:
+            return
+        self.motivo_falha = motivo
+        self.alternar("auto", origem="falha")
+
+    def vigiar(self):
+        if self.modo == "curva" and time.time() - self.ultima_leitura > SEM_LEITURA_MAX:
+            self.falha_curva(f"Mais de {SEM_LEITURA_MAX}s sem leitura dos sensores — voltei ao AUTO")
+        self.root.after(2000, self.vigiar)
 
     def faixa(self):
         """(liga, desliga) validos; se o campo estiver no meio da digitacao, usa o ultimo salvo."""
@@ -501,7 +666,7 @@ class App:
 
     def turbo_por_temperatura(self, maxima):
         """Liga o turbo acima do limite e devolve ao AUTO abaixo do outro (so o turbo que ele ligou)."""
-        if not self.var_auto_crit.get() or self.ocupado:
+        if not self.var_auto_crit.get() or self.ocupado or self.modo == "curva":
             return
         liga, desliga = self.faixa()
         if maxima < desliga:
@@ -519,8 +684,8 @@ class App:
         if primeira_vez or agora - self.ultimo_alerta > 60:  # no maximo 1 aviso/min
             self.ultimo_alerta = agora
             try:
-                # com o turbo automatico ligado o app ja esta agindo: so pisca na barra de tarefas
-                if not self.var_auto_crit.get():
+                # com turbo automatico ou curva o app ja esta agindo: so pisca na barra de tarefas
+                if not self.var_auto_crit.get() and self.modo != "curva":
                     self.root.deiconify()
                     self.root.lift()
                     self.root.attributes("-topmost", True)
@@ -533,27 +698,37 @@ class App:
     # ---- persistencia / saida
     def persistir(self):
         liga, desliga = self.faixa()
-        self.estado.update(turbo_liga=liga, turbo_desliga=desliga)
-        salvar_estado({"modo": self.modo, "auto_ao_fechar": self.var_fechar.get(),
+        t_min, t_max = self.curva()
+        self.estado.update(turbo_liga=liga, turbo_desliga=desliga, curva_min=t_min, curva_max=t_max)
+        modo = "curva" if self.retomar_curva else self.modo  # curva salva que ainda nao foi retomada
+        salvar_estado({"modo": modo, "auto_ao_fechar": self.var_fechar.get(),
                        "turbo_auto_critico": self.var_auto_crit.get(),
-                       "turbo_liga": liga, "turbo_desliga": desliga})
+                       "turbo_liga": liga, "turbo_desliga": desliga,
+                       "curva_min": t_min, "curva_max": t_max})
 
     def fechar(self):
         self.monitor.parar()
         if self.bandeja:
             self.bandeja.parar()
-        if self.var_fechar.get() and self.modo == "turbo":
+        # a curva depende do app vivo: ao fechar sempre devolve ao AUTO (mas lembra para a proxima)
+        sair_da_curva = self.modo == "curva"
+        if sair_da_curva or (self.var_fechar.get() and self.modo == "turbo"):
             self.lbl_status.config(text="Voltando ao AUTO...")
             self.root.update()
             ok, _ = aplicar_modo("auto")
-            if ok:
+            if ok and not sair_da_curva:
                 self.modo = "auto"
         self.persistir()
         self.root.destroy()
 
     # ---- ventoinha animada
     def animar(self):
-        alvo = 18.0 if self.modo == "turbo" else 2.5
+        if self.modo == "turbo":
+            alvo = 18.0
+        elif self.modo == "curva" and self.pct is not None:
+            alvo = 2.5 + 15.5 * (self.pct - CURVA_MIN) / (CURVA_MAX - CURVA_MIN)
+        else:
+            alvo = 2.5
         self.velocidade += (alvo - self.velocidade) * 0.06
         self.angulo = (self.angulo + self.velocidade) % 360
         if self.root.state() == "withdrawn":  # escondido na bandeja: nao gasta CPU desenhando
@@ -565,11 +740,11 @@ class App:
     def desenhar_fan(self):
         c, t = self.canvas, self.TAM
         cx = cy = t / 2
-        turbo = self.modo == "turbo"
-        cor = COR_TURBO if turbo else COR_AUTO
+        turbo = self.modo in ("turbo", "curva")   # destaque colorido
+        cor = {"turbo": COR_TURBO, "curva": COR_CURVA}.get(self.modo, COR_AUTO)
         c.delete("all")
 
-        if turbo or self.critico:
+        if self.modo == "turbo" or self.critico:
             for i, a in enumerate(("#2a0d0e", "#3d1012", "#55151a")):
                 r = t / 2 - 2 - i * 3
                 c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=a, width=3)
