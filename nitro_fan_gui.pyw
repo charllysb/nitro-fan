@@ -5,6 +5,7 @@ e mostra temperatura/RPM de CPU e GPU com alerta de temperatura critica.
 Fala direto com o firmware via WMI (classe AcerGamingFunction):
   - SetGamingFanBehavior  -> modo dos fans
   - GetGamingSysInfo      -> sensores (comando 0x0001 | id_sensor << 8)
+E pelo plano de energia do Windows (powercfg PROCTHROTTLEMAX): 99% corta o boost da CPU.
 Sem dependencias: so Python 3 (tkinter vem junto). Extensao .pyw = abre sem console.
 """
 import ctypes
@@ -12,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -37,6 +39,7 @@ HIST_MIN = 5        # minutos no grafico
 CURVA_MIN, CURVA_MAX = 40, 100   # % - abaixo de 40% o firmware nao desce do piso (~3900 RPM)
 CURVA_PASSO = 5     # % - arredondamento e descida maxima por leitura
 SEM_LEITURA_MAX = 10  # s sem leitura no modo curva -> volta ao AUTO
+LIMITE_CPU = 99     # % - estado maximo do processador que corta o boost
 
 COR_FUNDO = "#0f1012"
 COR_CARD = "#1a1c20"
@@ -158,6 +161,36 @@ def aplicar_modo(modo):
 def aplicar_rotacao(pct):
     """Rotacao das duas ventoinhas em % (so vale no modo curva)."""
     return chamar_firmware("SetGamingFanSpeed", [fan | (pct << 8) for fan in FAN_IDS])
+
+
+def ler_limite_cpu():
+    """Estado maximo do processador no plano ativo: (tomada, bateria) em %, ou None se nao der para ler."""
+    try:
+        r = subprocess.run(["powercfg", "/qh", "SCHEME_CURRENT", "SUB_PROCESSOR", "PROCTHROTTLEMAX"],
+                           capture_output=True, timeout=10, creationflags=NO_WINDOW)
+    except Exception:
+        return None
+    # a saida vem no idioma do Windows; os dois ultimos hexadecimais sao os valores atuais (tomada, bateria)
+    vals = re.findall(r"0x([0-9a-fA-F]+)", r.stdout.decode("ascii", "ignore"))
+    if r.returncode != 0 or len(vals) < 2:
+        return None
+    return int(vals[-2], 16), int(vals[-1], 16)
+
+
+def aplicar_limite_cpu(limitar):
+    """99% corta o boost: no Ryzen o boost so acontece quando o Windows pede 100%. 100% libera.
+    (PERFBOOSTMODE desabilitado nao segura o boost no Ryzen 3550H; medido.)"""
+    pct = str(LIMITE_CPU if limitar else 100)
+    for args in (["-setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", "PROCTHROTTLEMAX", pct],
+                 ["-setdcvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", "PROCTHROTTLEMAX", pct],
+                 ["-setactive", "SCHEME_CURRENT"]):
+        try:
+            r = subprocess.run(["powercfg", *args], capture_output=True, timeout=10, creationflags=NO_WINDOW)
+        except Exception as e:
+            return False, f"Falha ao chamar powercfg: {e}"
+        if r.returncode != 0:
+            return False, "O Windows recusou a mudança no plano de energia"
+    return True, "OK"
 
 
 def pct_da_curva(temp, t_min, t_max):
@@ -332,6 +365,9 @@ class Bandeja:
             *[pystray.MenuItem(m.upper(), self._escolher(m), radio=True,
                                checked=lambda item, m=m: app.modo == m) for m in MODOS],
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Limitar CPU", lambda: self._na_tela(lambda: app.alternar_limite(not app.limite_cpu)),
+                             checked=lambda item: bool(app.limite_cpu), enabled=lambda item: app.limite_cpu is not None),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", lambda: self._na_tela(app.fechar)))
         self.icon = pystray.Icon("nitro_fan", self.desenhar(None), "Nitro Fan", menu)
         self.icon.run_detached()
@@ -386,6 +422,7 @@ class App:
         self.ultimo_alerta = 0.0
         self.turbo_foi_automatico = False
         self.auto_pausado = False   # usuario mexeu na mao: espera esfriar antes de agir de novo
+        self.limite_cpu = None      # True = estado maximo < 100% no Windows; None = ainda nao lido
 
         root.title("Nitro Fan")
         root.configure(bg=COR_FUNDO)
@@ -466,6 +503,12 @@ class App:
 
         tk.Checkbutton(opts, text="Voltar ao AUTO ao fechar", variable=self.var_fechar,
                        command=self.persistir, **caixa).pack(anchor="w")
+        # nao vai para o estado salvo: quem guarda e o plano de energia do Windows
+        self.var_limite = tk.BooleanVar(value=False)
+        self.chk_limite = tk.Checkbutton(opts, text="Limitar CPU (sem boost: mais fria, mais lenta)",
+                                         variable=self.var_limite, command=self.alternar_limite,
+                                         state="disabled", **caixa)
+        self.chk_limite.pack(anchor="w")
 
         root.protocol("WM_DELETE_WINDOW", self.fechar)
         self.bandeja = Bandeja(self) if pystray else None
@@ -475,6 +518,7 @@ class App:
         self.monitor = Monitor(lambda d: root.after(0, self.on_sensores, d))
         self.animar()
         self.vigiar()
+        self.ler_limite()
 
     # ---- modo dos fans
     def alternar(self, novo=None, origem="manual"):
@@ -694,6 +738,33 @@ class App:
                 ctypes.windll.user32.FlashWindow(ctypes.windll.user32.GetParent(self.root.winfo_id()), True)
             except Exception:
                 pass
+
+    # ---- limite da CPU (plano de energia do Windows: continua valendo com o app fechado)
+    def ler_limite(self):
+        threading.Thread(target=lambda: self.root.after(0, self._limite_lido, ler_limite_cpu()),
+                         daemon=True).start()
+
+    def _limite_lido(self, vals):
+        self.limite_cpu = None if vals is None else max(vals) < 100
+        self.var_limite.set(bool(self.limite_cpu))
+        self.chk_limite.config(state="disabled" if vals is None else "normal")
+        self.atualizar_bandeja()
+
+    def alternar_limite(self, limitar=None):
+        if limitar is None:
+            limitar = self.var_limite.get()
+        self.var_limite.set(limitar)
+        self.chk_limite.config(state="disabled")
+        threading.Thread(target=lambda: self.root.after(0, self._limite_aplicado, limitar,
+                                                        *aplicar_limite_cpu(limitar)), daemon=True).start()
+
+    def _limite_aplicado(self, limitar, ok, msg):
+        if not ok:
+            self.lbl_status.config(text=msg, fg=COR_WARN)
+        else:
+            self.lbl_status.config(text=f"CPU limitada a {LIMITE_CPU}% — sem boost" if limitar
+                                   else "CPU liberada — boost ligado", fg=COR_SUAVE)
+        self.ler_limite()  # confirma o que o Windows gravou
 
     # ---- persistencia / saida
     def persistir(self):

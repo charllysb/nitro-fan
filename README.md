@@ -42,6 +42,12 @@ rodando em segundo plano e sem nada instalado.
   Auto/Curva/Turbo, Sair).
 - **Volta ao Auto ao fechar** (opcional), para o notebook não ficar no turbo
   depois de fechado.
+- **Limitar a CPU (opcional):** trava o estado máximo do processador em 99 % no
+  plano de energia do Windows, o que corta o boost. No AN515-43, com a mesma carga
+  em um núcleo, a CPU foi de 82 °C (pico de 94 °C), com as ventoinhas no máximo,
+  para 51 °C com elas na metade. O custo é rodar a 1,7 GHz em vez de ~3,1 GHz.
+  Quem guarda a opção é o Windows: ela continua valendo com o app fechado, até
+  você desmarcar. Também fica no menu da bandeja.
 
 ## Como usar
 
@@ -125,6 +131,14 @@ firmware é a única fonte de temperatura da CPU.
 `ReturnValue`, `PSComputerName`), não um `CimInstance`. Ler `$r.CimInstanceProperties`
 ou `$r.OutParameters` dá `$null`, que vira 0. A saída se lê por
 `$r.PSObject.Properties` (ou `$r.gmOutput`).
+
+**Limite da CPU:** não passa pelo firmware. É o `powercfg` gravando
+`PROCTHROTTLEMAX` em 99 ou 100, na tomada e na bateria do plano ativo, seguido de
+`powercfg -setactive SCHEME_CURRENT`. No Ryzen, desabilitar o "modo de aumento de
+desempenho do processador" (`PERFBOOSTMODE`) não segura o boost, porque é o
+próprio processador que sobe a frequência sempre que o Windows pede o estado P0.
+Com 99 % o Windows nunca pede o P0, e o clock cai para o P1: 1,7 GHz no 3550H,
+abaixo da base de 2,1 GHz.
 
 ## Arquivos
 
